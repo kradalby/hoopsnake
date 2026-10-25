@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -218,4 +219,82 @@ func TestSSHAuthenticationMetricsBounded(t *testing.T) {
 		}
 	}
 	t.Fatal("authentication metric missing")
+}
+
+func TestSSHCommandWithOpenStdin(t *testing.T) {
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, command, input string
+		closeInput           bool
+		status               int
+	}{
+		{"exit", "exit 7", "", false, 7},
+		{"line", `IFS= read -r line && test "$line" = unlock-input && exit 7`, "unlock-input\n", false, 7},
+		{"eof", "while IFS= read -r line; do :; done", "", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &TailnetSSH{command: []string{shell, "-c", tc.command}}
+			s.Handler = s.handle
+			s.authorizedPubKeys = append(s.authorizedPubKeys, signer.PublicKey())
+			s.PublicKeyHandler = s.validatePubkey
+			client, err := ssh.Dial("tcp", serveTestSSH(t, s, signer), &ssh.ClientConfig{
+				User: "arbitrary", Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+				HostKeyCallback: ssh.FixedHostKey(signer.PublicKey()), Timeout: 5 * time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			session, err := client.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			stdin, err := session.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stdin.Close()
+			if err := session.Start("ignored-command"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(stdin, tc.input); err != nil {
+				t.Fatal(err)
+			}
+			if tc.closeInput {
+				if err := stdin.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			finished := make(chan error, 1)
+			go func() { finished <- session.Wait() }()
+			select {
+			case err := <-finished:
+				status := 0
+				if err != nil {
+					var exitError *ssh.ExitError
+					if !errors.As(err, &exitError) {
+						t.Fatal(err)
+					}
+					status = exitError.ExitStatus()
+				}
+				if status != tc.status {
+					t.Fatalf("SSH status = %d, want %d", status, tc.status)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("SSH command did not finish before client stdin was closed")
+			}
+		})
+	}
 }

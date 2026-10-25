@@ -54,6 +54,8 @@ authorized-key lists. Only a configured key may authenticate. Credential tests
 require unused API/OAuth secrets to be removed before child commands can run.
 Real SSH sessions also check inherited environment, credential removal, command
 exit status, startup failure, and signal termination in both terminal modes.
+Non-PTY commands must complete while client stdin remains open, including after
+reading one input line; explicitly closing stdin must still deliver EOF.
 Varied rejected usernames and keys must leave only two authentication metric
 series, one for each outcome. The VM checks the unlock marker immediately after
 PTY execution, before another session can create it.

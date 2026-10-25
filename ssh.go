@@ -169,14 +169,24 @@ func (s *TailnetSSH) handle(sess ssh.Session) {
 			return
 		}
 	} else {
-		cmd.Stdin = sess
+		// Wait must not depend on the peer closing its input.
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			log.Printf("Error preparing command stdin without a PTY: %v", err)
+			return
+		}
+		defer stdin.Close()
 		cmd.Stdout = sess
 		cmd.Stderr = sess
-		err := cmd.Start()
+		err = cmd.Start()
 		if err != nil {
 			log.Printf("Error starting the command without a PTY: %v", err)
 			return
 		}
+		go func() {
+			defer stdin.Close()
+			_, _ = io.Copy(stdin, sess)
+		}()
 		err = cmd.Wait()
 		if err != nil {
 			log.Printf("Error waiting for the command: %v", err)
