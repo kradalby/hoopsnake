@@ -1,330 +1,298 @@
-{self, ...}: {
+{
+  self,
+  inputs,
+  ...
+}: {
   perSystem = {
-    config,
     pkgs,
-    final,
     system,
     ...
   }: let
-    tls-cert = pkgs.runCommand "selfSignedCerts" {buildInputs = [pkgs.openssl];} ''
-      openssl req \
-        -x509 -newkey rsa:4096 -sha256 -days 365 \
-        -nodes -out cert.pem -keyout key.pem \
-        -subj '/CN=headscale' -addext "subjectAltName=DNS:headscale"
-
+    keys = pkgs.runCommand "hoopsnake-test-keys" {nativeBuildInputs = [pkgs.openssh];} ''
       mkdir -p $out
-      cp key.pem cert.pem $out
+      for name in host client rejected; do
+        ssh-keygen -N "" -t ed25519 -f "$out/$name"
+      done
+      (printf 'alice-boot '; cat "$out/host.pub") > "$out/known_hosts"
     '';
-
-    # OK, so this is pretty lol/lmao.  Since we need working API
-    # keys to build the machines that'll boot into headscale, we
-    # have to use "known" API keys
-    # that the headscale server knows about; we also need those in
-    # the environment file that alice's hoopsnake nixos config
-    # module uses; and so: we run a mock headscale server at build
-    # time, set up the api keys and then take a DB dump.
-    headscaleAccess = let
-      config = {
-        server_url = "https://headscale";
-        listen_addr = "127.0.0.1:8080";
-        unix_socket = "@VARLIB@/headscale.sock";
-        noise.private_key_path = "@VARLIB@/noise-private.key";
-        prefixes.v4 = "100.64.0.0/10";
-        derp.server = {
-          enabled = true;
-          region_id = 999;
-          private_key_path = "@VARLIB@/derp-private.key";
-          stun_listen_addr = "127.0.0.1:3478";
-        };
-        database = {
-          type = "sqlite";
-          sqlite.path = "@VARLIB@/headscale.db";
-        };
-        dns.magic_dns = false;
-        dns.override_local_dns = false;
-      };
-      configFile = pkgs.writeText "headscale-setup-config.yaml" (builtins.toJSON config);
-    in
-      pkgs.runCommand "setup-headscale"
-      {
-        nativeBuildInputs = [
-          pkgs.headscale
-          pkgs.sqlite
+    policy = sshUsers:
+      pkgs.writeText "policy.json" (builtins.toJSON {
+        tagOwners."tag:hoopsnake" = ["owner@"];
+        acls = [
+          {
+            action = "accept";
+            src = sshUsers;
+            dst = ["tag:hoopsnake:22"];
+          }
+          {
+            action = "accept";
+            src = ["bob@" "relay@"];
+            dst = ["tag:hoopsnake:9021"];
+          }
         ];
-      }
-      ''
-        set -eux
-
-        mkdir -p $out
-        export VARLIB=$(pwd)/var-lib
-        mkdir -p $VARLIB
-
-        substitute ${configFile} ./config.yaml --subst-var VARLIB
-        headscale serve --config ./config.yaml &
-        server_pid="$!"
-        trap "kill $server_pid" EXIT
-        for try in $(seq 1 20); do
-            if [ -e $VARLIB/headscale.sock ]; then
-              break
-            fi
-            sleep 1
-        done
-
-        headscale users create --config ./config.yaml bob
-        api_key="$(headscale apikeys create --config ./config.yaml)"
-        auth_key="$(headscale preauthkeys create --reusable -e 100y --config ./config.yaml -u 1)"
-        cat >$out/apikey-envfile <<EOF
-        TS_API_KEY=$api_key
-        TS_BASE_URL=${config.server_url}
-        EOF
-        cat >$out/authkey-envfile <<EOF
-        TS_AUTHKEY=$auth_key
-        TS_BASE_URL=${config.server_url}
-        EOF
-
-        trap - EXIT
-        kill $server_pid
-        wait
-        sqlite3 $VARLIB/headscale.db .dump | grep -E -e '^INSERT INTO (api_keys|users|pre_auth_keys)' |tee $out/database-dump.sql
-      '';
-    hostkey = pkgs.runCommand "hostkey" {buildInputs = [pkgs.openssh];} ''
-      mkdir $out
-      ssh-keygen -N "" -t ed25519 -f $out/hostkey
-      (echo -n 'alice-boot ' ; cat $out/hostkey.pub) > $out/known_hosts
-    '';
-    clientKey = pkgs.runCommand "clientKey" {buildInputs = [pkgs.openssh];} ''
-      mkdir $out
-      ssh-keygen -N "" -t ed25519 -f $out/client
-    '';
-    bootloader = {config, ...}: {
-      virtualisation.useBootLoader = true;
-      virtualisation.useEFIBoot = true;
-      virtualisation.cores = 4;
-      virtualisation.memorySize = 1024;
-      boot.loader.systemd-boot.enable = true;
-      boot.loader.efi.canTouchEfiVariables = true;
-      environment.systemPackages = [pkgs.efibootmgr];
-      boot.kernelParams = [
-        "ip=${config.networking.primaryIPAddress}:::255.255.255.0::eth1:off"
-      ];
-      boot.initrd.network = {
-        enable = true;
-        udhcpc.enable = false;
-      };
-      boot.initrd.secrets = {
-        "/etc/hosts" = "${config.environment.etc.hosts.source}";
-      };
-      security.pki.certificateFiles = ["${tls-cert}/cert.pem"];
-    };
-    headscalePort = 8080;
-    stunPort = 3478;
-
-    headscale = {config, ...}: {
-      services = {
-        headscale = {
-          enable = true;
-          port = headscalePort;
-          settings = {
-            server_url = "https://headscale";
-            ip_prefixes = ["100.64.0.0/10"];
-            dns.magic_dns = false;
-            dns.override_local_dns = false;
-            derp.server = {
-              enabled = true;
-              region_id = 999;
-              stun_listen_addr = "0.0.0.0:${toString stunPort}";
-            };
-          };
+      });
+    allow = policy ["bob@" "relay@"];
+    deny = policy ["bob@"];
+    peer = {
+      imports = [inputs.headscale.nixosModules.testkit-peer];
+      environment.systemPackages = [pkgs.openssh pkgs.curl pkgs.netcat-openbsd];
+      environment.etc = {
+        "client-key" = {
+          source = "${keys}/client";
+          mode = "0600";
         };
-        nginx = {
-          enable = true;
-          virtualHosts.headscale = {
-            addSSL = true;
-            sslCertificate = "${tls-cert}/cert.pem";
-            sslCertificateKey = "${tls-cert}/key.pem";
-            locations."/" = {
-              proxyPass = "http://127.0.0.1:${toString headscalePort}";
-              proxyWebsockets = true;
-            };
-          };
+        "rejected-key" = {
+          source = "${keys}/rejected";
+          mode = "0600";
         };
       };
-      networking.firewall = {
-        allowedTCPPorts = [
-          80
-          443
-        ];
-        allowedUDPPorts = [stunPort];
-      };
-      environment.systemPackages = [
-        pkgs.headscale
-        (pkgs.writeShellApplication {
-          name = "import-pregenerated-keys";
-          runtimeInputs = [pkgs.sqlite];
-          text = ''
-            sqlite3 /var/lib/headscale/db.sqlite <${headscaleAccess}/database-dump.sql
-          '';
-        })
-      ];
-    };
-    bob = {
-      services.tailscale.enable = true;
-      security.pki.certificateFiles = ["${tls-cert}/cert.pem"];
-      networking.useDHCP = false;
-      environment.etc.sshKey = {
-        source = "${clientKey}/client";
-        mode = "0600";
-      };
-      environment.systemPackages = [
-        (pkgs.writeShellApplication {
-          name = "ssh-to-alice";
-          runtimeInputs = [pkgs.openssh];
-          text = ''
-            alice_ip="$1"
-            echo "${hostkey} fingerprint:" >&2
-            ssh-keygen -l -f ${hostkey}/hostkey
-            echo "${hostkey} contents:" >&2
-            cat ${hostkey}/hostkey >&2
-            echo "${hostkey}/known_hosts file contents:" >&2
-            cat ${hostkey}/known_hosts >&2
-
-            sed "s/^alice-boot/$alice_ip/" ${hostkey}/known_hosts | tee /tmp/resolved-known-hosts
-            echo | ssh -v -o UserKnownHostsFile=/tmp/resolved-known-hosts -i /etc/sshKey shell@"$alice_ip"
-          '';
-        })
-      ];
     };
   in {
-    checks =
-      if !pkgs.lib.hasSuffix "linux" system
-      then {}
-      else {
-        hoopsnake-systemd = pkgs.testers.runNixOSTest {
-          name = "hoopsnake-systemd-initrd-stage1";
-          nodes = {
-            inherit headscale bob;
-            alice = {
-              lib,
-              config,
-              ...
-            }: let
-              fakeShell = pkgs.writeShellApplication {
-                name = "success";
-                text = "touch /tmp/fnord";
-              };
-            in {
-              imports = [
-                bootloader
-                self.nixosModules.default
-              ];
-              testing.initrdBackdoor = true;
-              boot.initrd.systemd = {
+    checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+      hoopsnake-systemd = pkgs.testers.runNixOSTest {
+        name = "hoopsnake-systemd-initrd-stage1";
+        nodes = {
+          headscale = {
+            imports = [inputs.headscale.nixosModules.testkit];
+            services.headscale.settings.node.ephemeral.inactivity_timeout = "70s";
+            environment.systemPackages = [pkgs.jq];
+          };
+          bob = peer;
+          relay = {
+            imports = [peer];
+            systemd.services.tailscaled.environment.TS_DEBUG_ALWAYS_USE_DERP = "1";
+          };
+          alice = {
+            config,
+            lib,
+            ...
+          }: let
+            unlock = pkgs.writeShellApplication {
+              name = "unlock";
+              text = ''
+                test -z "''${TS_AUTHKEY+x}"
+                IFS= read -r input
+                test "$input" = unlock-input
+                if test -t 0; then
+                  echo hoopsnake-pty
+                else
+                  echo hoopsnake-no-pty
+                fi
+                echo hoopsnake-unlock
+                touch /tmp/unlocked
+              '';
+            };
+          in {
+            imports = [self.nixosModules.default];
+            virtualisation = {
+              useBootLoader = true;
+              useEFIBoot = true;
+              cores = 2;
+              memorySize = 1024;
+            };
+            boot.loader.systemd-boot.enable = true;
+            boot.loader.efi.canTouchEfiVariables = true;
+            boot.kernelParams = ["ip=${config.networking.primaryIPAddress}:::255.255.255.0::eth1:off"];
+            boot.initrd.network = {
+              enable = true;
+              udhcpc.enable = false;
+              hoopsnake = {
                 enable = true;
-                initrdBin = [fakeShell];
-              };
-              boot.initrd.network.hoopsnake = {
-                enable = true;
-                ssh = {
-                  authorizedKeysFile = "${clientKey}/client.pub";
-                  commandLine = ["/bin/success"];
-                };
+                ssh.authorizedKeysFile = "${keys}/client.pub";
+                ssh.commandLine = ["/bin/unlock"];
                 systemd-credentials = {
-                  privateHostKey.file = "${hostkey}/hostkey";
-                  privateHostKey.encrypted = false;
-
-                  # This is a bit janky: The module expects to pass
-                  # a client ID & secret, but we don't have one
-                  # (headscale doesn't support it):
-                  clientId.text = "disabled";
-                  clientId.encrypted = false;
-                  clientSecret.text = "disabled";
-                  clientSecret.encrypted = false;
+                  privateHostKey = {
+                    file = "${keys}/host";
+                    encrypted = false;
+                  };
+                  clientId = {
+                    text = "disabled";
+                    encrypted = false;
+                  };
+                  clientSecret = {
+                    text = "disabled";
+                    encrypted = false;
+                  };
                 };
                 tailscale = {
                   name = "alice-boot";
                   tags = ["tag:hoopsnake"];
-                  environmentFile = "${headscaleAccess}/authkey-envfile";
                   tsnetVerbose = true;
+                  cleanup.deleteExisting = true;
                 };
               };
             };
+            boot.initrd.secrets."/etc/hosts" = config.environment.etc.hosts.source;
+            testing.initrdBackdoor = true;
+            boot.initrd.systemd = {
+              enable = true;
+              initrdBin = [unlock];
+              services.hoopsnake = {
+                # The driver supplies a runtime key before starting the real module's unit.
+                wantedBy = lib.mkForce [];
+                environment.TS_NO_LOGS_NO_SUPPORT = "1";
+                serviceConfig.EnvironmentFile = "/run/hoopsnake.env";
+              };
+            };
           };
-
-          testScript = ''
-            import time
-            import json
-
-            def wait_for_hoopsnake_registered(name):
-                "Poll until hoopsnake appears in the list of hosts, then return its IP."
-                while True:
-                    bob.wait_until_succeeds(f"tailscale ping -c 1 {name}")
-                    status = json.loads(bob.succeed("tailscale status --json --peers --self=false"))
-                    if status["Peer"] is not None:
-                      basic_entry = [elt["TailscaleIPs"][0] for _, elt in status["Peer"].items() if elt["HostName"] == name]
-                      if len(basic_entry) == 1:
-                          return basic_entry[0]
-                    time.sleep(1)
-
-            with subtest("Test setup"):
-                for node in [headscale, bob]:
-                        node.start()
-                headscale.wait_for_unit("headscale")
-                headscale.wait_for_open_port(${toString headscalePort})
-                headscale.wait_for_open_port(443)
-
-                # Create user and hoopsnake preauth key:
-                headscale.succeed("import-pregenerated-keys")
-
-                # Create headscale preauth-key that we use for tailscale
-                authkey = headscale.succeed("headscale preauthkeys -u 1 create --reusable")
-
-                # Connect peers
-                up_cmd = f"tailscale up --login-server 'https://headscale' --auth-key {authkey}"
-                bob.execute(up_cmd)
-
-            with subtest("Unlock alice's boot progress"):
-                alice.start()
-                alice.wait_for_unit("hoopsnake")
-                alice_ip = wait_for_hoopsnake_registered("alice-boot")
-                bob.succeed(f"ssh-to-alice {alice_ip}", timeout=90)
-                alice.wait_until_succeeds("test -f /tmp/fnord")
-                alice.switch_root()
-
-            with subtest("Finish booting alice"):
-                alice.wait_for_unit("multi-user.target", timeout=90)
-          '';
         };
+        testScript = ''
+          import json
+          import shlex
 
-        configtest = pkgs.testers.runNixOSTest {
-          name = "hoopsnake-configtest";
-          nodes = {
-            inherit headscale bob;
-          };
+          def nodes():
+              return json.loads(headscale.succeed("headscale nodes list -o json"))
 
-          testScript = ''
-            with subtest("Test setup"):
-                for node in [headscale, bob]:
-                        node.start()
-                headscale.wait_for_unit("headscale")
-                headscale.wait_for_open_port(${toString headscalePort})
-                headscale.wait_for_open_port(443)
+          def identity():
+              matches = [n for n in nodes() if n["givenName"] == "alice-boot"]
+              assert len(matches) == 1, matches
+              return matches[0]
 
-                # Create user and hoopsnake preauth key:
-                headscale.succeed("import-pregenerated-keys")
+          def ssh(ip, key="client", tty=False):
+              return (
+                  "printf 'unlock-input\\n' | timeout 15 ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes "
+                  "-o ConnectTimeout=5 -o StrictHostKeyChecking=yes "
+                  "-o HostKeyAlias=alice-boot -o UserKnownHostsFile=${keys}/known_hosts "
+                  f"-i /etc/{key}-key {'-tt' if tty else '-T'} arbitrary@{ip} ignored-command"
+              )
 
-                # Create headscale preauth-key that we use for tailscale
-                authkey = headscale.succeed("headscale preauthkeys -u 1 create --reusable")
+          with subtest("Runtime control and peer registration"):
+              headscale.start()
+              for peer, user in [(bob, "bob"), (relay, "relay")]:
+                  peer.start()
+                  key = headscale.succeed(f"hs-authkey {user}").strip()
+                  peer.succeed(f"hs-join {shlex.quote(key)}")
+              headscale.succeed("headscale policy set -f ${allow}")
+              key = headscale.succeed("hs-authkey owner --ephemeral --tags tag:hoopsnake").strip()
+              alice.start()
+              alice.wait_for_unit("initrd.target")
+              alice.succeed("printf '%s\\n' " + shlex.quote("TS_AUTHKEY=" + key) +
+                            " TS_BASE_URL=http://headscale > /run/hoopsnake.env")
+              alice.succeed("systemctl start hoopsnake")
+              bob.wait_until_succeeds("tailscale ping --c=1 alice-boot", timeout=120)
+              first = identity()
+              assert "tag:hoopsnake" in first["tags"], first
+              assert first["preAuthKey"]["ephemeral"], first
+              ip = first["ipAddresses"][0]
 
-                # Connect peers
-                up_cmd = f"tailscale up --login-server 'https://headscale' --auth-key {authkey}"
-                bob.execute(up_cmd)
-                bob.execute(f"echo '{authkey}' > /tmp/clientId")
-            configtest_cmd = "systemd-run --wait --pipe --service-type=exec -E HOME=/tmp -p EnvironmentFile=${headscaleAccess}/authkey-envfile ${
-              self.packages.${pkgs.stdenv.targetPlatform.system}.hoopsnake
-            }/bin/hoopsnake -configtest -name bob /usr/bin/env"
-            bob.succeed(configtest_cmd)
-          '';
-        };
+          with subtest("SSH key denial has an allowed control"):
+              alice.fail("test -e /tmp/unlocked")
+              status, output = bob.execute(ssh(ip, "rejected") + " 2>&1")
+              assert status == 255 and "Permission denied (publickey)" in output, (status, output)
+              alice.fail("test -e /tmp/unlocked")
+              status, output = bob.execute(ssh(ip).replace("-o BatchMode=yes", "-o BatchMode=yes -o PubkeyAuthentication=no") + " 2>&1")
+              assert status == 255 and "Permission denied" in output, (status, output)
+              alice.fail("test -e /tmp/unlocked")
+              output = bob.succeed(ssh(ip))
+              assert "hoopsnake-unlock" in output and "hoopsnake-no-pty" in output, output
+              alice.succeed("test -e /tmp/unlocked")
+              # The SSH username and requested command do not select local accounts or commands.
+              alice.succeed("rm /tmp/unlocked")
+              output = bob.succeed(ssh(ip, tty=True))
+              assert "hoopsnake-unlock" in output and "hoopsnake-pty" in output, output
+
+          with subtest("Direct and forced DERP carry application traffic"):
+              bob.wait_until_succeeds(
+                  rf"tailscale ping --c=3 {ip} | grep -E 'via (\[[0-9a-f:]+\]|[0-9.]+):[0-9]+'", timeout=60)
+              assert "hoopsnake-unlock" in bob.succeed(ssh(ip))
+              relay.wait_until_succeeds(
+                  f"tailscale ping --c=1 --until-direct=false {ip} | grep 'via DERP(headscale)'", timeout=60)
+              assert "hoopsnake-unlock" in relay.succeed(ssh(ip))
+              metrics = bob.succeed(f"curl -fsS --max-time 10 http://{ip}:9021/metrics")
+              assert 'success="false"' in metrics and 'success="true"' in metrics, metrics
+              assert "hoopsnake_running" in metrics
+              ipv6 = next(address for address in first["ipAddresses"] if ":" in address)
+              assert "hoopsnake-unlock" in bob.succeed(ssh(ipv6))
+              bob.succeed(f"curl -gfsS --max-time 10 http://[{ipv6}]:9021/metrics | grep hoopsnake_running")
+              # The underlay must not expose the application listener.
+              bob.fail("nc -z -w 3 alice 22")
+
+          with subtest("Direct SSH survives control and DERP outage; relay recovers"):
+              headscale.succeed("systemctl stop headscale")
+              try:
+                  assert "hoopsnake-unlock" in bob.succeed(ssh(ip))
+                  relay.fail(ssh(ip))
+                  assert "hoopsnake-unlock" in bob.succeed(ssh(ip))
+              finally:
+                  headscale.succeed("systemctl start headscale")
+              headscale.succeed("HEADSCALE_CLI_TIMEOUT=60s headscale health")
+              relay.wait_until_succeeds(
+                  f"tailscale ping --c=1 --until-direct=false {ip} | grep 'via DERP(headscale)'", timeout=120)
+              assert "hoopsnake-unlock" in relay.succeed(ssh(ip))
+
+          with subtest("Tailnet ACL denial preserves allowed metrics and SSH"):
+              headscale.succeed("headscale policy set -f ${deny}")
+              relay.wait_until_succeeds(f"! nc -z -w 3 {ip} 22", timeout=60)
+              status, output = relay.execute(ssh(ip) + " 2>&1")
+              assert status != 0 and "hoopsnake-unlock" not in output, (status, output)
+              relay.succeed(f"curl -fsS --max-time 10 http://{ip}:9021/metrics | grep hoopsnake_running")
+              assert "hoopsnake-unlock" in bob.succeed(ssh(ip))
+
+          with subtest("Restart creates a fresh ephemeral identity"):
+              alice.succeed("systemctl stop hoopsnake")
+              headscale.wait_until_succeeds(
+                  "headscale nodes list -o json | jq -e 'all(.[]; .givenName != \"alice-boot\")'", timeout=180)
+              alice.succeed("systemctl start hoopsnake")
+              bob.wait_until_succeeds("tailscale ping --c=1 alice-boot", timeout=120)
+              second = identity()
+              assert second["nodeKey"] != first["nodeKey"], (first, second)
+              assert "tag:hoopsnake" in second["tags"], second
+              assert "hoopsnake-unlock" in bob.succeed(ssh(second["ipAddresses"][0]))
+
+          with subtest("Authenticated unlock and shutdown complete boot"):
+              alice.succeed("test -e /tmp/unlocked")
+              alice.switch_root()
+              alice.wait_for_unit("multi-user.target", timeout=90)
+              headscale.wait_until_succeeds(
+                  "headscale nodes list -o json | jq -e 'all(.[]; .givenName != \"alice-boot\")'", timeout=180)
+        '';
       };
+      configtest = pkgs.testers.runNixOSTest {
+        name = "hoopsnake-configtest";
+        nodes = {
+          headscale.imports = [inputs.headscale.nixosModules.testkit];
+          bob = {pkgs, ...}: {
+            environment.systemPackages = [self.packages.${system}.hoopsnake pkgs.curl];
+          };
+        };
+        testScript = ''
+          import shlex
+          import json
+          start_all()
+          key = headscale.succeed("hs-authkey config --ephemeral").strip()
+          command = (
+              "systemd-run --wait --pipe --collect -p User=nobody -p AmbientCapabilities=CAP_NET_ADMIN "
+              "-p NoNewPrivileges=yes -E HOME=/tmp -E TS_NO_LOGS_NO_SUPPORT=1 "
+              "-E TS_BASE_URL=http://headscale -E TS_AUTHKEY=" + shlex.quote(key) +
+              " timeout --kill-after=5 45 ${self.packages.${system}.hoopsnake}/bin/hoopsnake -configtest -name config -tags tag:hoopsnake -stateDir /tmp/config /bin/true 2>&1"
+          )
+          with subtest("Real package can register without root or OAuth credentials"):
+              assert "Configuration tested ok" in bob.succeed(command, timeout=120)
+          with subtest("Missing credentials fail closed"):
+              output = bob.fail("env -u TS_AUTHKEY hoopsnake -configtest -name missing -tags tag:hoopsnake /bin/true 2>&1")
+              assert "neither TS_API_KEY" in output, output
+          with subtest("OAuth credentials work but the legacy device scope is rejected"):
+              client = json.loads(headscale.succeed(
+                  "headscale oauth-clients create --scope auth_keys --scope devices:core --tag tag:hoopsnake -o json"))
+              token = json.loads(bob.succeed(
+                  "curl -fsS --max-time 10 -X POST http://headscale/api/v2/oauth/token "
+                  "--data-urlencode grant_type=client_credentials "
+                  "--data-urlencode " + shlex.quote("client_id=" + client["id"]) +
+                  " --data-urlencode " + shlex.quote("client_secret=" + client["key"])))
+              assert token["access_token"], token
+              output = bob.fail(
+                  "env TS_BASE_URL=http://headscale TS_API_CLIENT_ID=" + shlex.quote(client["id"]) +
+                  " TS_API_CLIENT_SECRET=" + shlex.quote(client["key"]) +
+                  " hoopsnake -configtest -name oauth -tags tag:hoopsnake /bin/true 2>&1", timeout=30)
+              assert "invalid_scope" in output and "device" in output, output
+          with subtest("Invalid key cannot pass configtest"):
+              output = bob.fail(command.replace(shlex.quote(key), "invalid-key").replace(
+                  "-configtest", "-configtest -tsnetVerbose"), timeout=120)
+              assert "invalid pre auth key" in output or "invalid authkey" in output, output
+              assert "Configuration tested ok" not in output, output
+              assert "Configuration tested ok" in bob.succeed(command, timeout=120)
+        '';
+      };
+    };
   };
 }
