@@ -42,9 +42,7 @@ func (s *TailnetSSH) setupAuthorizedKeys() error {
 			authorizedKeysBytes = rest
 		}
 	}
-	if len(s.authorizedPubKeys) > 0 {
-		s.PublicKeyHandler = s.validatePubkey
-	}
+	s.PublicKeyHandler = s.validatePubkey
 	return nil
 }
 
