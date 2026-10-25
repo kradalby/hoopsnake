@@ -104,6 +104,11 @@ is, if your login name is your github username; substitute that
 
 An empty or omitted authorized-key list rejects all SSH authentication.
 
+The configured command inherits the service environment after tailnet credentials
+have been removed, with `TERM` set for PTY sessions. SSH reports the command's exit
+status, or a nonzero status if it cannot start. Authentication metrics use only
+the bounded `success` label; usernames and public keys remain in logs.
+
 The SSH server also needs a private key to finish the handshake (and
 authentication _to_ the client). You can generate one with the
 commandline `ssh-keygen -t ssh-keygen -t ed25519 -f hoopsnake` and

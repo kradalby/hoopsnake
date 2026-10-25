@@ -73,13 +73,13 @@
                 test -z "''${TS_AUTHKEY+x}"
                 IFS= read -r input
                 test "$input" = unlock-input
+                touch /tmp/unlocked
                 if test -t 0; then
                   echo hoopsnake-pty
                 else
                   echo hoopsnake-no-pty
                 fi
                 echo hoopsnake-unlock
-                touch /tmp/unlocked
               '';
             };
           in {
@@ -190,6 +190,7 @@
               alice.succeed("rm /tmp/unlocked")
               output = bob.succeed(ssh(ip, tty=True))
               assert "hoopsnake-unlock" in output and "hoopsnake-pty" in output, output
+              alice.succeed("test -e /tmp/unlocked")
 
           with subtest("Direct and forced DERP carry application traffic"):
               bob.wait_until_succeeds(

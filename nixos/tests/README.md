@@ -52,6 +52,11 @@ With `TS_AUTHKEY`, key capabilities and tags come from the supplied key;
 The Go tests also exercise real SSH handshakes with omitted, empty and populated
 authorized-key lists. Only a configured key may authenticate. Credential tests
 require unused API/OAuth secrets to be removed before child commands can run.
+Real SSH sessions also check inherited environment, credential removal, command
+exit status, startup failure, and signal termination in both terminal modes.
+Varied rejected usernames and keys must leave only two authentication metric
+series, one for each outcome. The VM checks the unlock marker immediately after
+PTY execution, before another session can create it.
 
 The pinned Headscale implements OAuth and device management, but rejects
 Hoopsnake's legacy `device` scope. The VM test proves that the same credentials

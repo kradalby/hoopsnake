@@ -23,7 +23,7 @@ var (
 	authentications = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "hoopsnake_authentications",
 		Help: "Number of authentications attempted",
-	}, []string{"user", "pubkey_fpr", "pubkey", "success"})
+	}, []string{"success"})
 )
 
 func (s *TailnetSSH) setupAuthorizedKeys() error {
@@ -54,12 +54,7 @@ func (s *TailnetSSH) validatePubkey(ctx ssh.Context, key ssh.PublicKey) bool {
 			matched = true
 		}
 	}
-	authentications.With(prometheus.Labels{
-		"user":       ctx.User(),
-		"pubkey":     string(gossh.MarshalAuthorizedKey(key)),
-		"pubkey_fpr": gossh.FingerprintSHA256(key),
-		"success":    strconv.FormatBool(matched),
-	}).Inc()
+	authentications.WithLabelValues(strconv.FormatBool(matched)).Inc()
 	return matched
 }
 
@@ -136,10 +131,20 @@ func setWinsize(f *os.File, width, height int) {
 func (s *TailnetSSH) handle(sess ssh.Session) {
 	// The command is passed in from the CLI, it's trusted by fiat:
 	cmd := exec.CommandContext(sess.Context(), s.command[0], s.command[1:]...) // #nosec G204
+	defer func() {
+		status := 1
+		if cmd.ProcessState != nil {
+			status = cmd.ProcessState.ExitCode()
+			if wait, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && wait.Signaled() {
+				status = 128 + int(wait.Signal())
+			}
+		}
+		_ = sess.Exit(status)
+	}()
 
 	ptyReq, winCh, isPty := sess.Pty()
 	if isPty {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TERM=%s", ptyReq.Term))
+		cmd.Env = append(os.Environ(), fmt.Sprintf("TERM=%s", ptyReq.Term))
 		f, err := pty.Start(cmd)
 		if err != nil {
 			log.Printf("Error starting the command in a PTY: %v", err)
