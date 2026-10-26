@@ -8,7 +8,6 @@ I do that too, but I really dislike the idea of having yet another highly-privil
 
 * [Authentication](docs/authentication.md)
 * [Threat model](docs/threat-model.md)
-* [Integration tests](nixos/tests/README.md)
 
 ## What you get
 

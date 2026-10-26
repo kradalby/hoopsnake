@@ -19,13 +19,6 @@ import (
 var ErrNoAPIKeys = fmt.Errorf("neither TS_API_KEY, nor TS_API_CLIENT_ID and TS_API_CLIENT_SECRET are set")
 
 func (s *TailnetSSH) tsnetServer(ctx context.Context) (*tsnet.Server, error) {
-	// Unselected fallback credentials must not reach the unlock command.
-	defer func() {
-		for _, name := range []string{"TS_AUTHKEY", "TS_API_KEY", "TS_API_CLIENT_ID", "TS_API_CLIENT_SECRET"} {
-			_ = os.Unsetenv(name)
-		}
-	}()
-
 	state, err := mem.New(nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("allocating in-memory state: %w", err)
@@ -128,7 +121,7 @@ func (s *TailnetSSH) cleanupOldNodes(ctx context.Context, tsClient *tailscale.Cl
 		return fmt.Errorf("listing existing devices: %w", err)
 	}
 	for _, dev := range devs {
-		if dev.Hostname != s.serviceName || dev.ConnectedToControl || dev.LastSeen == nil {
+		if dev.Hostname != s.serviceName {
 			continue
 		}
 		recency := time.Since(dev.LastSeen.Time)

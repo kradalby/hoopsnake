@@ -70,10 +70,6 @@ To use oauth keypairs,
    the environment variable / file strategy.)
 4. Run `hoopsnake ...` and it should be a proper tailscale oauth client.
 
-Hoopsnake clears all four tailnet credential environment variables during
-initialization, including unused fallback credentials, before starting the
-configured command.
-
 ### other considerations: Cleaning out old device entries
 
 `hoopsnake` will mint auth tokens that generate "ephemeral"
@@ -101,14 +97,6 @@ the following commandline: `curl
 https://api.github.com/users/$(whoami)/keys | jq -r '.[].key'` (that
 is, if your login name is your github username; substitute that
 `$(whoami)` for your github username if not).
-
-An empty or omitted authorized-key list rejects all SSH authentication.
-
-The configured command inherits the service environment after tailnet credentials
-have been removed, with `TERM` set for PTY sessions. SSH reports the command's exit
-status, or a nonzero status if it cannot start. Non-PTY command completion does
-not require the client to close stdin. Authentication metrics use only
-the bounded `success` label; usernames and public keys remain in logs.
 
 The SSH server also needs a private key to finish the handshake (and
 authentication _to_ the client). You can generate one with the
